@@ -13,7 +13,7 @@ a status board useful — none of it is reachable by anyone and there is no
 running instance. §2 explains why no payment licence applies to this shape in
 the first place.
 
-**Last synced with the code:** 2026-10-21, commit `1849362`.
+**Last synced with the code:** 2026-10-21, commit `1c1c292`.
 **Suite at that commit:** 250 unit tests + 451 live assertions, 0 failures,
 0 resource warnings under `-W always::ResourceWarning`.
 
