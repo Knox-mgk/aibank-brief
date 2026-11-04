@@ -13,9 +13,10 @@ a status board useful — none of it is reachable by anyone and there is no
 running instance. §2 explains why no payment licence applies to this shape in
 the first place.
 
-**Last synced with the code:** 2026-10-21, commit `1c1c292`.
-**Suite at that commit:** 250 unit tests + 451 live assertions, 0 failures,
-0 resource warnings under `-W always::ResourceWarning`.
+**Last synced with the code:** 2026-11-04, commit `aa5205d`.
+**Suite at that commit:** 250 unit tests + 451 live assertions
+(74 HTTP + 82 MCP + 139 dashboard + 65 MFA + 91 DOM) + 33 packaging
+assertions, 0 failures, re-run on 2026-11-04.
 
 There is a sibling project: [corebank](https://github.com/Knox-mgk/corebank-brief)
 is a fork of this code aimed at multi-tenant Banking-as-a-Service, where *we*
@@ -146,7 +147,7 @@ the provider moved the money.
 
 ## 6. Status board
 
-Working and verified, re-run on 2026-10-21 at commit `1849362`:
+Working and verified, re-run on 2026-11-04 at commit `aa5205d`:
 
 | | state |
 |---|---|
@@ -171,14 +172,18 @@ Working and verified, re-run on 2026-10-21 at commit `1849362`:
 **The real provider API has been called for READS only.** Against a live
 sandbox key, auth, JSON handling and response shapes are confirmed on bank
 listing (598 Nigerian banks), balance and account resolution. But
-`POST /transfers` is refused by the sandbox with *"Please enable IP Whitelisting
-to access this service"* (HTTP 400) until the account whitelists the caller's
-address, and no real webhook has ever been delivered. So transfer field names,
-success-status strings and webhook payloads are still documentation-derived.
+`POST /transfers` is still refused with HTTP 400, and the refusal **moved** on
+2026-10-23: it used to be *"Please enable IP Whitelisting to access this
+service"*, which was a network problem, and once a fixed egress address was
+whitelisted it became *"merchant is not enabled to make transfers"* — an
+**account entitlement** the provider grants after compliance review. No code
+and no infrastructure changes that. No real webhook has ever been delivered
+either, so transfer field names, success-status strings and webhook payloads
+are still documentation-derived.
 
 Every test and smoke script uses a fake provider. **The layer that actually
-moves money is the least proven layer in the project**, and one whitelisted
-address plus one real transfer closes it.
+moves money is the least proven layer in the project**, and the only thing that
+closes it is the provider granting the Transfers product.
 
 ### Bugs this project found in itself
 
@@ -247,6 +252,20 @@ remains, verified by a negative control — remove the guard and the test fails.
   "'user_id'"}`** — a Python class name and a quoted dict key. Under a
   self-hosted shape the HTTP surface *is* the documentation.
 
+- **A concurrency assertion that measured the machine, not the product.** The
+  duplicate-webhook test counted threads whose reply said `settled`. A
+  duplicate echoes the claim row's stored result, which is NULL while the
+  winner is still mid-settlement — so the count measured the thread *schedule*.
+  Identical code passed on Python 3.14 and failed on 3.12. Nothing ever settled
+  twice; the invariants (one event row, one claim, two ledger entries, trial
+  balance zero, balance debited once) are what the test asserts now.
+- **The README told strangers to install from a repo that 404s.** After the
+  code repo went private the install line still read
+  `pip install git+https://…`, so the first command anyone ran failed with an
+  error that reads as a broken project rather than a closed repo. Documentation
+  that contradicts the deployment is the same class of defect as code that
+  contradicts the docs.
+
 The pattern worth naming: almost none of these were found by reading the code.
 They were found by *running* it — against a live socket, a built wheel, a real
 browser engine, a real sandbox key — and several were invisible to a green test
@@ -275,14 +294,17 @@ suite.
   exit code are enough to alert on, and are not observability.
 - **Not published to any package index, deliberately.** The wheel builds and
   installs clean, and that stays a local capability. `pip install aibank` does
-  not work and is not going to.
+  not work and is not going to. The code repo is private, so the only install
+  is `pip install git+ssh://git@github.com/Knox-mgk/aibank` with author access.
 - Not load-tested.
 
 ## 8. What would come next, in order
 
-1. **Whitelist an egress address and run one real transfer plus one real
-   webhook.** This is the single largest unknown in the project and the only
-   item that stands between it and real money.
+1. **Get the provider's Transfers entitlement granted, then run one real
+   transfer and one real webhook.** This is the single largest unknown in the
+   project and the only item between it and real money. It is not an
+   engineering task: the network half was solved on 2026-10-23 and what remains
+   is a compliance request to the provider.
 2. **Open the dashboard in a real browser and judge the layout.** Machine
    verification has gone as far as it can.
 3. **Build the container images once** on a machine that has a container
@@ -290,10 +312,11 @@ suite.
 4. **Account recovery** — email verification and password reset. Today an
    operator with CLI access is the only recovery path.
 5. **Inbound money** — collections and virtual accounts, so funding is not
-   admin-gated. (The fork, corebank, has probed this: a permanent per-customer
-   account number requires identity verification first, because the account
-   number lands on a licensed institution's core banking system and that
-   institution owes the identity record.)
+   admin-gated. (The fork, corebank, has now *built* this: a permanent
+   per-customer account number requires identity verification first, because
+   the account number lands on a licensed institution's core banking system and
+   that institution owes the identity record. Porting it back here is optional,
+   not required.)
 6. **Postgres behind the data layer**, which is what multi-process actually
    requires.
 
