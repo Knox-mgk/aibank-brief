@@ -7,16 +7,20 @@ implementation. The code is at
 404 for you unless you are the author. The design is public so it can be read
 and discussed; the implementation is not.
 
-**Nothing described here is deployed, and it holds no money.** The status board
-in §6 lists unfinished and known-broken work openly, because that is what makes
-a status board useful — none of it is reachable by anyone and there is no
-running instance. §2 explains why no payment licence applies to this shape in
-the first place.
+**Nothing described here holds money, and the one deployment that exists
+cannot move any.** A single instance runs on the author's own VPS, bound to
+loopback and reachable only through an SSH forward — no public route, no
+customers, no provider credential. Its `/health` reports
+`"payouts": "none"`, which is the activation gate refusing to load a real
+provider (§6). The status board in §6 lists unfinished and known-broken work
+openly, because that is what makes a status board useful. §2 explains why no
+payment licence applies to this shape in the first place.
 
-**Last synced with the code:** 2026-11-04, commit `aa5205d`.
-**Suite at that commit:** 250 unit tests + 451 live assertions
-(74 HTTP + 82 MCP + 139 dashboard + 65 MFA + 91 DOM) + 33 packaging
-assertions, 0 failures, re-run on 2026-11-04.
+**Last synced with the code:** 2026-11-05, commit `9ead69d`.
+**Suite at that commit:** 468 unit tests, 0 failures, re-run on 2026-11-05 on
+the author's phone (202s). Plus 451 live assertions against real servers
+(74 HTTP + 82 MCP + 139 dashboard + 65 MFA + 91 DOM) and 33 packaging
+assertions, last run 2026-11-04.
 
 There is a sibling project: [corebank](https://github.com/Knox-mgk/corebank-brief)
 is a fork of this code aimed at multi-tenant Banking-as-a-Service, where *we*
@@ -67,8 +71,8 @@ Enforced structurally, not by convention. Three separate trust domains:
 
 | domain | may do |
 |---|---|
-| **Agent** | request payouts, read own balance, add payees |
-| **User** (human session) | set policy, fund wallets, approve/reject/refund, rotate keys |
+| **Agent** | request payouts, read own balance, add payees, create and fund a subordinate strictly within its own grant |
+| **User** (human session) | set policy, fund wallets, grant and revoke authority, approve/reject/refund, rotate keys |
 | **Admin** | pricing, settlement deposits, sweeper, cross-tenant reads |
 
 An agent key presented to a user-domain route is rejected before any handler
@@ -80,9 +84,39 @@ reachable, and a bug of exactly that class let any account holder rewrite
 another's agent limits (§6). The checks now sit on the **method**, not the
 route.
 
+### Delegation: an agent that hires an agent
+
+An agent holding `financial_delegation` may create a subordinate, fund it out
+of its own allocation, and delegate authority to it — **strictly within its own
+grant**, with depth capped. This is what makes the model an org chart rather
+than a flat list of keys, and it is the part most likely to be got wrong, so
+the rules are the narrow ones:
+
+- A delegation requesting more than the delegator itself holds is refused.
+  Authority can only ever narrow on the way down.
+- An authority may not be granted an expiry that **outlives its parent's**, and
+  expiry is checked for the agent *and every ancestor* at evaluation time, with
+  `authority_expired` reported distinguishably from `no_authority`.
+- Revoking a grant **cascades to money already allocated under it**. A
+  subordinate's next spend is refused, not merely its next grant.
+- Authority is evaluated **inside the same write transaction that places the
+  hold**, against amount + fee, on every payout and again when a human
+  approves one. It was previously recorded correctly and consulted nowhere on
+  the payout path — a delegated subtree cap was invisible and revocation
+  stopped nothing (§6).
+- Policies and authorities are mirrored in both directions, so an owner setting
+  a ceiling through the dashboard **is** an owner granting authority, rather
+  than leaving the agent silently with none.
+
+The agent tool set is defined by what it is willing to hand out, not by what it
+remembers to withhold: owner-only powers (granting itself authority, reading
+another owner's agents) are absent from the MCP registry entirely, so no code
+path can expose them later by omission.
+
 ## 4. The ledger
 
-A general ledger with its invariants enforced in code:
+A general ledger with its invariants enforced **in the database**, not merely in
+the module that writes it:
 
 1. **Postings within an entry sum to exactly zero.** An unbalanced entry is
    rejected, not corrected.
@@ -94,6 +128,37 @@ A general ledger with its invariants enforced in code:
    UNIQUE constraint rather than an application check.
 
 Money is integer minor units throughout; no float touches a balance.
+
+### Why those invariants are triggers and not assertions
+
+All three of immutability, the no-zero-leg rule and double entry itself used to
+live inside `ledger.py`. That module kept them perfectly — and **nothing else
+had to.** Any other statement on the same connection (a repair script, a future
+endpoint, `sqlite3` on the live file) could rewrite an amount, drop a leg, or
+leave a one-sided entry, and the books would simply read differently afterwards
+with no trace of the change. An invariant enforced only by the code that
+happens to write it is an invariant that ends at the next author, and for a
+ledger that is the whole of the asset: **the books are evidence only if they
+cannot be edited after the fact.**
+
+Schema v6 moved all three below the application. UPDATE and DELETE on
+`postings` abort unconditionally, DELETE on `entries` aborts, a zero-amount leg
+aborts. Double entry needed more care, because SQLite has no deferred triggers
+and an entry's legs necessarily arrive one at a time — a per-INSERT sum check
+would reject every two-leg entry on its first leg. So an entry is **sealed**
+when its legs are complete: sealing an entry whose legs do not net to zero
+aborts, appending a leg to a sealed entry aborts, and unsealing aborts.
+
+The subtlety worth keeping: the summary columns the seal check reads are
+maintained by a trigger that **recomputes** them from postings rather than
+incrementing, and a second trigger refuses any value that disagrees with the
+postings it claims to summarise. Without that, setting `legs_sum = 0` by hand
+would let a one-legged entry seal — money from nothing.
+
+The migration backfills and seals balanced history and deliberately leaves a
+pre-existing imbalance **unsealed and visible** rather than blessing it;
+`backup()` counts those, so an archive carrying an entry the database never
+verified fails verification now instead of at restore.
 
 **Money flow**
 
@@ -145,27 +210,170 @@ Guessing is refused throughout: the sweeper flags an expired hold for
 reconciliation rather than declaring it failed, because nobody knows whether
 the provider moved the money.
 
+### Three defects the lifecycle work found
+
+All three were found by writing the ten mandated lifecycle scenarios, and all
+three are the same shape — an identity or a comparison that was *nearly* right:
+
+- **Event dedupe keyed on `(event, data.id)` and ignored the provider status**,
+  but Flutterwave reuses one transfer id across every callback for that
+  transfer. A genuine `FAILED → SUCCESSFUL` transition was therefore answered
+  "duplicate" and dropped before any state machine saw it. Status is now part
+  of event identity: replays still dedupe, transitions reach the state machine,
+  which refuses to re-debit and records the disagreement.
+- **An idempotency key matched on reference alone**, so retrying the same key
+  with a different amount or payee returned the earlier payout and reported
+  success for a payment the caller never asked for. A reused key whose request
+  differs is now refused, naming the differing field.
+- **A stale success reaching a refunded or rejected payout** is recorded in
+  `payout_state_conflicts` for an operator, not applied and not dropped:
+  applying it invents a debit nobody authorised, dropping it hides money that
+  may really have left.
+
+Holds also stopped lying in the same pass: `capture_hold` raises instead of
+silently matching no rows when the hold is not active, and `release_hold`
+refuses to release a captured hold.
+
+## 5a. A second payout rail: CoreBank, trusted no further than Flutterwave
+
+The sibling project `corebank` holds a ledger that already has money in it, so
+aibank can settle a payout through it instead of through a card/transfer
+provider. The adapter satisfies the same surface `FlutterwaveClient` does and is
+selected by the same three-variable activation gate, so a deployment that does
+not set `AIBANK_PAYOUT_PROVIDER` is unchanged in every respect.
+
+**The decision the whole thing turns on: a 5xx is not a refusal.**
+
+`_submit` branches on one flag to decide whether the agent's hold is *released*
+or *left held*. Get it wrong in one direction and the agent respends money that
+has already left; wrong in the other and funds are stranded behind a hold for a
+payment that was cleanly refused. Copying Flutterwave's mapping was the
+expensive mistake on offer, because Flutterwave treats every HTTP reply as
+definite — and for Flutterwave that is correct: it answers a malformed or
+unaffordable transfer with a 4xx and queues nothing.
+
+CoreBank is not shaped like that. Its write path is hold + post + capture inside
+**one SQLite transaction, with the HTTP response written afterwards.** A 500 can
+therefore come from the catch-all *after* that transaction committed: the
+posting exists, the money has moved, and the body says `{"error": "internal"}`.
+Treating that as a refusal would release aibank's hold against a debit CoreBank
+had already made. So:
+
+| provider says | classification | hold |
+|---|---|---|
+| 4xx | definite — CoreBank parsed it, decided, and rolled back (its own hold included) | released |
+| 5xx | indeterminate — the posting may have committed before the reply failed | kept |
+| timeout, connection error, unreadable body, 2xx with no entry id | indeterminate | kept |
+
+Two different mechanisms do two different jobs here and neither substitutes for
+the other: the **classification** protects aibank's hold, the **idempotency
+key** protects CoreBank's ledger. An adapter with the right key and the wrong
+classification double-spends; with the right classification and the wrong key it
+pays twice on retry.
+
+Four consequences worth stating:
+
+- **The payout reference *is* the idempotency key** — not a value minted per
+  attempt, which would make a retry carry a different key and have CoreBank pay
+  twice. It is already derived from the payout row and the caller's own key, so
+  it is stable across retries of one payout and unique across different ones.
+- **A terminal submit reply settles immediately.** A synchronous provider that
+  answers "settled" must not be left `submitted`, or the hold lives until the
+  sweeper, the agent's funds are immobilised for the TTL, and an operator gets a
+  queue of payouts that already worked. The branch keys on **what the provider
+  said**, not on which adapter is loaded.
+- **An agent key, not an admin key.** The funding wallet is fixed by the
+  credential aibank holds and cannot be redirected by anything in the request.
+  The admin key would have been easier and untenanted — the body would then have
+  had to name the agent, and one leaked key would drain any agent in any
+  organisation.
+- **The adapter sends CoreBank nothing resembling permission** — no policy
+  verdict, no ceilings, no agent id, no balance, asserted absent by a test.
+  CoreBank re-derives authority, limits, fee, currency and available balance on
+  its own side and refuses requests aibank has already allowed. The test funds
+  the fake CoreBank with *less* than aibank believes it can spend, and then — in
+  a second test — funds it generously and watches the same payout succeed, or
+  the refusal could have come from aibank's own policy and the claim would be
+  untested.
+
+Reads refuse rather than invent: CoreBank has no by-reference entry lookup, no
+bank directory and no name resolution, so the adapter **raises** on all four
+instead of returning a plausible empty result — `reconcile` treats the
+provider's answer as authoritative about real money, and an adapter reporting
+"no such transfer" for a payout CoreBank had settled would drive a
+reconciliation to the wrong conclusion.
+
+**Adding the second provider exposed a latent bug in the activation gate.**
+`activation_status` asked for `FLW_SECRET_KEY` unconditionally. With one
+provider that reads as a spelling choice; with two it is a hole — a deployment
+selecting `corebank` while holding a Flutterwave key would have been activated
+**by that key**, a credential for one partner opening a money path to another,
+and a deployment holding only a CoreBank key could never activate at all. The
+credential is now looked up per provider.
+
 ## 6. Status board
 
-Working and verified, re-run on 2026-11-04 at commit `aa5205d`:
+Working and verified, re-run on 2026-11-05 at commit `9ead69d`:
 
 | | state |
 |---|---|
 | Ledger, holds, idempotency, reversals | done |
+| Ledger immutability enforced by **database triggers**, not by the writing module | done (schema v6) |
 | Policy engine incl. count ceiling + WAT-correct resets | done |
 | Three trust domains over HTTP | done |
-| Dashboard (single file, strict CSP, no build step) | done — **layout never judged by a human eye** |
-| MCP server, 8 typed tools over stdio | done |
+| Authority, delegation, expiry and revoke-cascade | done — enforced inside the hold transaction |
+| Delegation + reporting exposed over HTTP **and** MCP | done |
+| Payout lifecycle: 28 scenarios, no second debit, no silent hold | done |
+| Second payout rail (CoreBank adapter) with its own indeterminacy mapping | done against a fake CoreBank **and** a real `corebank serve` process |
+| Payout activation gate: three independent assertions, per-provider credential | done |
+| Throttles on payouts, key auth, agent requests, transfers, subordinate creation | done — written in their own transactions |
+| Rotatable, database-backed admin keys with overlap and immediate revoke | done |
+| Dashboard (single file, strict CSP with a per-response nonce, no build step) | done — **layout never judged by a human eye** |
+| MCP server, typed tools over stdio | done |
 | TOTP second factor on the human session | done, RFC 6238 vectors pinned |
 | Brute-force throttle: per-account **and** per-source-address | done |
 | Deploy: Dockerfile, compose, nginx TLS, systemd units, quickstart | written; **docker/compose never built** |
-| Verified ledger backups (read back, not just written) | done |
+| Backups: written, **read back, and restore-rehearsed** weekly | done — see below |
 | Reconciliation tooling that refuses to self-correct | done |
 | pip-installable wheel, zero deps | builds and installs clean (33 assertions) |
+| One deployment, loopback-only, no provider credential | running on the author's VPS, `payouts: none` |
 | Real payment provider, **write** path | **not proven** — see below |
-| Inbound collections / virtual accounts | not implemented |
+| Inbound collections / virtual accounts | not implemented (the fork built it; porting back is optional) |
 | Email verification, password reset | not implemented |
 | Postgres / multi-process | not implemented, and it is a correctness boundary |
+
+### The backup half that was theatre
+
+aibank wrote four verified copies a day and **never read one back.** The copies
+were checked *as they were written*, which cannot see the failures that arrive
+afterwards — a truncated write from a full disk, a bad block, silent
+corruption — and there was no drill at all.
+
+Worse, the verifier opened the archive **in place**, and `connect()` sets
+`journal_mode = WAL`, which is a write: it modified the very files whose
+integrity was in question, left `-wal`/`-shm` sidecars beside them, and would
+fail outright on read-only media. It now copies the archive out, carries any
+sidecars with it, and opens the copy — with a test asserting the archive's
+sha256 and mtime are unchanged afterwards and that no sidecar appeared.
+
+The second finding is the one that generalises. Both products required
+`schema_version == SCHEMA_VERSION` to call an archive restorable. **The day a
+migration lands, every retained copy is one version behind**, so 27 of 28 read
+as RED and the real zero-decision recovery window collapses to the hours since
+the schema bump — which trains an operator to ignore a failing drill. Verdicts
+are now three: `ok` restores with nobody in the loop, `MIGR` restores after a
+migration that was **rehearsed** on the scratch copy, `BAD` would not come back.
+The rehearsal re-counts entries, postings and the trial balance afterwards,
+because a migration that rebuilds a table to change a CHECK constraint can drop
+rows on the DROP/RENAME, and "the migration ran" is not the claim worth making.
+
+`restore-verify` exits 0 restorable, 1 unusable, **2 nothing found** — the 2
+matters, because an empty directory used to be indistinguishable from a passing
+drill, which is a timer that reports success forever on no backups.
+
+**Note on the live instance:** its database is at schema v7 against code v8, so
+it is itself in the `MIGR` state the drill was built to report honestly rather
+than fail on. Migrating it is a pending deployment task, not a code task.
 
 ### The one blocker that no amount of coding removes
 
@@ -183,7 +391,10 @@ are still documentation-derived.
 
 Every test and smoke script uses a fake provider. **The layer that actually
 moves money is the least proven layer in the project**, and the only thing that
-closes it is the provider granting the Transfers product.
+closes it is the provider granting the Transfers product. The CoreBank rail
+(§5a) is a genuine second path and was driven end to end against a real
+CoreBank process — but both sides of it are the author's own ledgers, so it
+proves the protocol, not the banking rail.
 
 ### Bugs this project found in itself
 
@@ -265,6 +476,53 @@ remains, verified by a negative control — remove the guard and the test fails.
   error that reads as a broken project rather than a closed repo. Documentation
   that contradicts the deployment is the same class of defect as code that
   contradicts the docs.
+- **Authority was recorded correctly and consulted nowhere that mattered.**
+  `request_payout` asked the policy engine only, so a delegated subtree cap was
+  invisible and `revoke_authority` stopped nothing — the delegation model was
+  bookkeeping, not enforcement. Authority is now evaluated inside the same write
+  transaction that places the hold.
+- **The activation gate could be opened by a credential alone.** The only thing
+  between the deployment and real money leaving a real bank account was a blank
+  `FLW_SECRET_KEY`, on a host that owns the provider-whitelisted egress IP: one
+  env-var write plus a restart, no code change and no recorded decision. Depth
+  of control was one, and its single element was the kind of value someone
+  pastes in while fixing something unrelated. Activation now needs three
+  independent assertions, one of which is a *sentence* no boolean-flipping
+  config template can produce.
+- **The dev-secrets escape hatch was one assertion** whose value is exactly what
+  a template defaults to, or what an operator types at 02:00 chasing an
+  unrelated "X is not set". Setting it on a production host silently swapped the
+  pepper guarding every API-key hash and every sealed TOTP secret for a constant
+  published in the repository, and **nothing in the running service looked
+  different.** Now two assertions plus an outright refusal when the deployment
+  looks like production at all — and the refusal is the half that matters: env
+  vars are things an operator can type, deployment markers are things the
+  deployment asserts about itself.
+- **The brute-force counter could never be spent.** Extending the login counter
+  to cover payouts would have been the obvious move and was wrong: it is written
+  by the same transaction as the thing it counts, and a refused payout **rolls
+  back**, so the attacker's budget rolls back with it and the audit trail shows
+  nothing happened. Throttle events are now written in their own transactions at
+  the request edge.
+- **The admin key was one value in an env file.** The comparison was correct;
+  the lifecycle was the finding. Changing it meant editing a root-owned file and
+  restarting, so every client had to cut over in the same instant — which means
+  it never changed. No revoke for a suspected leak, no expiry for a key issued
+  for one afternoon, and exactly one key, so no admin action could be attributed
+  to anyone.
+- **The backup verifier wrote to the archives it was verifying**, and a schema
+  bump made 27 of 28 retained copies report RED (above).
+- **A merge silently deleted a security fix, and the suite stayed green.**
+  Found 2026-11-05 on *pushed* `main`. A merge resolution in the fork reordered
+  `require_agent_authority` so the staff bypass was checked *before* the caller's
+  asserted identity — and that flag is true for the unauthenticated local
+  handle, so a supplied `user_id` was discarded entirely and one account holder
+  could again raise another's agent ceiling or freeze their agent through the
+  library. Nothing re-ran the one test file that attacks through the bare handle
+  after the merge, so `git log` showed a fix that the code no longer contained.
+  The lesson is narrower than "run your tests": **a merge is a code change that
+  no review diff shows you**, because the conflict resolution *is* the edit, and
+  the file reads plausibly either way.
 
 The pattern worth naming: almost none of these were found by reading the code.
 They were found by *running* it — against a live socket, a built wheel, a real
@@ -289,13 +547,18 @@ suite.
 - **Plain HTTP from the application itself.** It belongs behind a
   TLS-terminating proxy before it leaves localhost; a session token in clear is
   the whole account. The shipped compose service publishes no port of its own,
-  so it cannot be reached around the proxy.
+  so it cannot be reached around the proxy. The live instance is reached only
+  over an SSH forward, which is why it needs no proxy today — and also why
+  nothing has ever exercised the TLS path.
 - **No metrics or structured logging.** A health endpoint and a reconciliation
   exit code are enough to alert on, and are not observability.
 - **Not published to any package index, deliberately.** The wheel builds and
   installs clean, and that stays a local capability. `pip install aibank` does
   not work and is not going to. The code repo is private, so the only install
   is `pip install git+ssh://git@github.com/Knox-mgk/aibank` with author access.
+- **The live instance's database is one schema version behind its code**
+  (v7 vs v8). It is loopback-only with no provider credential, so nothing is at
+  risk, but it means the deployment has not exercised the newest migration.
 - Not load-tested.
 
 ## 8. What would come next, in order
@@ -307,17 +570,19 @@ suite.
    is a compliance request to the provider.
 2. **Open the dashboard in a real browser and judge the layout.** Machine
    verification has gone as far as it can.
-3. **Build the container images once** on a machine that has a container
+3. **Migrate the live instance from v7 to v8** and re-run the restore drill
+   against it, so the deployment and the code agree.
+4. **Build the container images once** on a machine that has a container
    runtime. They are written and reviewed but unexecuted.
-4. **Account recovery** — email verification and password reset. Today an
+5. **Account recovery** — email verification and password reset. Today an
    operator with CLI access is the only recovery path.
-5. **Inbound money** — collections and virtual accounts, so funding is not
+6. **Inbound money** — collections and virtual accounts, so funding is not
    admin-gated. (The fork, corebank, has now *built* this: a permanent
    per-customer account number requires identity verification first, because
    the account number lands on a licensed institution's core banking system and
    that institution owes the identity record. Porting it back here is optional,
    not required.)
-6. **Postgres behind the data layer**, which is what multi-process actually
+7. **Postgres behind the data layer**, which is what multi-process actually
    requires.
 
 ---
