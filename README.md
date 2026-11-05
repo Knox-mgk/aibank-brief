@@ -16,11 +16,11 @@ provider (§6). The status board in §6 lists unfinished and known-broken work
 openly, because that is what makes a status board useful. §2 explains why no
 payment licence applies to this shape in the first place.
 
-**Last synced with the code:** 2026-11-05, commit `0139cba`.
-**Suite at that commit:** 472 unit tests, 0 failures, re-run on 2026-11-05 on
-the author's phone — under `-W always::ResourceWarning`, 0 warnings. Plus live
-assertions against real servers: 74 HTTP, 100 MCP, 65 MFA (dashboard and DOM
-last run 2026-11-04: 139 + 91), and 33 packaging assertions.
+**Last synced with the code:** 2026-11-05, commit `82cc2e2`.
+**Suite at that commit:** 475 unit tests, 0 failures, re-run on 2026-11-05 on
+the author's phone (116s) — under `-W always::ResourceWarning`, 0 warnings.
+Plus 469 live assertions against real servers, all re-run the same day: 74
+HTTP, 100 MCP, 139 dashboard, 65 MFA, 91 DOM, and 33 packaging assertions.
 
 There is a sibling project: [corebank](https://github.com/Knox-mgk/corebank-brief)
 is a fork of this code aimed at multi-tenant Banking-as-a-Service, where *we*
@@ -580,10 +580,10 @@ suite.
   nothing has ever exercised the TLS path.
 - **No metrics or structured logging.** A health endpoint and a reconciliation
   exit code are enough to alert on, and are not observability.
-- **Not published to any package index, deliberately.** The wheel builds and
-  installs clean, and that stays a local capability. `pip install aibank` does
-  not work and is not going to. The code repo is private, so the only install
-  is `pip install git+ssh://git@github.com/Knox-mgk/aibank` with author access.
+- **Never going to a package index, by decision.** The wheel builds and
+  installs clean, and that is kept purely as a self-check that the install
+  path works. This is private software, not a library: the only install is
+  `pip install git+ssh://git@github.com/Knox-mgk/aibank` with author access.
 - **The live instance now runs this brief's commit**, migrated v7 → v8 on
   2026-11-05. It had been eight commits behind — code and database agreeing at
   schema 7, so stale rather than half-migrated, and it refused to start against
