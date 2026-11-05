@@ -16,11 +16,11 @@ provider (§6). The status board in §6 lists unfinished and known-broken work
 openly, because that is what makes a status board useful. §2 explains why no
 payment licence applies to this shape in the first place.
 
-**Last synced with the code:** 2026-11-05, commit `9ead69d`.
-**Suite at that commit:** 468 unit tests, 0 failures, re-run on 2026-11-05 on
-the author's phone (202s). Plus 451 live assertions against real servers
-(74 HTTP + 82 MCP + 139 dashboard + 65 MFA + 91 DOM) and 33 packaging
-assertions, last run 2026-11-04.
+**Last synced with the code:** 2026-11-05, commit `0139cba`.
+**Suite at that commit:** 472 unit tests, 0 failures, re-run on 2026-11-05 on
+the author's phone — under `-W always::ResourceWarning`, 0 warnings. Plus live
+assertions against real servers: 74 HTTP, 100 MCP, 65 MFA (dashboard and DOM
+last run 2026-11-04: 139 + 91), and 33 packaging assertions.
 
 There is a sibling project: [corebank](https://github.com/Knox-mgk/corebank-brief)
 is a fork of this code aimed at multi-tenant Banking-as-a-Service, where *we*
@@ -334,9 +334,10 @@ Working and verified, re-run on 2026-11-05 at commit `9ead69d`:
 | Brute-force throttle: per-account **and** per-source-address | done |
 | Deploy: Dockerfile, compose, nginx TLS, systemd units, quickstart | written; **docker/compose never built** |
 | Backups: written, **read back, and restore-rehearsed** weekly | done — see below |
+| `connect()` closes its handle when the file turns out to be unreadable | done 2026-11-05 — the restore drill was the leaking caller |
 | Reconciliation tooling that refuses to self-correct | done |
 | pip-installable wheel, zero deps | builds and installs clean (33 assertions) |
-| One deployment, loopback-only, no provider credential | running on the author's VPS, `payouts: none` |
+| One deployment, loopback-only, no provider credential | running on the author's VPS, `payouts: none` — but **eight commits behind** this brief |
 | Real payment provider, **write** path | **not proven** — see below |
 | Inbound collections / virtual accounts | not implemented (the fork built it; porting back is optional) |
 | Email verification, password reset | not implemented |
@@ -371,9 +372,12 @@ rows on the DROP/RENAME, and "the migration ran" is not the claim worth making.
 matters, because an empty directory used to be indistinguishable from a passing
 drill, which is a timer that reports success forever on no backups.
 
-**Note on the live instance:** its database is at schema v7 against code v8, so
-it is itself in the `MIGR` state the drill was built to report honestly rather
-than fail on. Migrating it is a pending deployment task, not a code task.
+**Note on the live instance:** it runs an **older commit**, not an unmigrated
+database. Checked on the host: deployed code reports schema version 7 and the
+database is at 7, so the two agree and nothing is pending there. What is stale
+is the deployment itself — eight commits behind, so it predates delegation, the
+second payout rail and the newest migration entirely. Redeploying is a
+deployment task; there is no migration debt to pay first.
 
 ### The one blocker that no amount of coding removes
 
@@ -523,6 +527,30 @@ remains, verified by a negative control — remove the guard and the test fails.
   The lesson is narrower than "run your tests": **a merge is a code change that
   no review diff shows you**, because the conflict resolution *is* the edit, and
   the file reads plausibly either way.
+- **A failed database open leaked its handle, and the warning blamed the
+  standard library.** Found 2026-11-05. `connect()` opens the file and then
+  issues four PRAGMAs, which are the first *reads* — so a corrupt or truncated
+  database raises after the handle exists and before the caller receives it.
+  Nobody can close a connection they were never given, so the descriptor and
+  its WAL sidecar survived until the garbage collector ran, at which point
+  `-W always::ResourceWarning` reported "unclosed database" against whatever
+  line happened to trigger collection. The restore drill is the caller that
+  matters: opening deliberately-unreadable archives is its job. Fixed in both
+  repos, with a negative control proving the leak detector can fail.
+- **The guard against the *older* leak was scoped to the wrong half of the
+  repo, and that is the more useful finding.** An AST sweep has pinned "never
+  read an `HTTPError` body without closing it" since the original socket leak
+  was fixed — but it scanned the package directory only. Eighteen handlers in
+  `tests/` and `scripts/` were still leaking, and those leak *harder*: a smoke
+  script's request helper runs on every refusal the script asserts, and the
+  throttle tests exist to provoke 401s and 429s in volume. A full suite run
+  emitted 30 resource warnings from one test helper alone; it is 0 now. Test
+  and script helpers are also the code a human copies when writing the next
+  adapter, so excluding them guarded the half that mattered least.
+  The generalisable pair: **a resource warning names where collection
+  happened, not where the leak is** — so "that warning is from a dependency"
+  is the wrong conclusion to reach cheaply — and **a guard is only as good as
+  its scope, which nothing re-checks once it is green.**
 
 The pattern worth naming: almost none of these were found by reading the code.
 They were found by *running* it — against a live socket, a built wheel, a real
@@ -556,9 +584,12 @@ suite.
   installs clean, and that stays a local capability. `pip install aibank` does
   not work and is not going to. The code repo is private, so the only install
   is `pip install git+ssh://git@github.com/Knox-mgk/aibank` with author access.
-- **The live instance's database is one schema version behind its code**
-  (v7 vs v8). It is loopback-only with no provider credential, so nothing is at
-  risk, but it means the deployment has not exercised the newest migration.
+- **The live instance runs an eight-commit-old copy of the code** — not a
+  half-migrated database. Its code and its database both report schema 7 and
+  agree with each other; the gap is that the deployment predates delegation,
+  the second payout rail and the newest migration. It is loopback-only with no
+  provider credential, so nothing is at risk, but it means none of the recent
+  work has ever run outside a phone.
 - Not load-tested.
 
 ## 8. What would come next, in order
