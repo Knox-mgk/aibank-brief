@@ -337,7 +337,7 @@ Working and verified, re-run on 2026-11-05 at commit `9ead69d`:
 | `connect()` closes its handle when the file turns out to be unreadable | done 2026-11-05 — the restore drill was the leaking caller |
 | Reconciliation tooling that refuses to self-correct | done |
 | pip-installable wheel, zero deps | builds and installs clean (33 assertions) |
-| One deployment, loopback-only, no provider credential | running on the author's VPS, `payouts: none` — but **eight commits behind** this brief |
+| One deployment, loopback-only, no provider credential | running on the author's VPS at this brief's commit, schema 8, `payouts: none` |
 | Real payment provider, **write** path | **not proven** — see below |
 | Inbound collections / virtual accounts | not implemented (the fork built it; porting back is optional) |
 | Email verification, password reset | not implemented |
@@ -372,12 +372,12 @@ rows on the DROP/RENAME, and "the migration ran" is not the claim worth making.
 matters, because an empty directory used to be indistinguishable from a passing
 drill, which is a timer that reports success forever on no backups.
 
-**Note on the live instance:** it runs an **older commit**, not an unmigrated
-database. Checked on the host: deployed code reports schema version 7 and the
-database is at 7, so the two agree and nothing is pending there. What is stale
-is the deployment itself — eight commits behind, so it predates delegation, the
-second payout rail and the newest migration entirely. Redeploying is a
-deployment task; there is no migration debt to pay first.
+**Note on the live instance:** it now runs at this brief's commit, migrated to
+schema 8 on 2026-11-05 — backup taken and integrity-checked first, v7 → v8
+applied, trial balance 0 after. Before that it ran an eight-commit-old copy
+whose code and database agreed at schema 7: stale, not half-migrated. It
+refused to start against the older database rather than guessing, which is
+exactly what the version check exists for.
 
 ### The one blocker that no amount of coding removes
 
@@ -584,12 +584,12 @@ suite.
   installs clean, and that stays a local capability. `pip install aibank` does
   not work and is not going to. The code repo is private, so the only install
   is `pip install git+ssh://git@github.com/Knox-mgk/aibank` with author access.
-- **The live instance runs an eight-commit-old copy of the code** — not a
-  half-migrated database. Its code and its database both report schema 7 and
-  agree with each other; the gap is that the deployment predates delegation,
-  the second payout rail and the newest migration. It is loopback-only with no
-  provider credential, so nothing is at risk, but it means none of the recent
-  work has ever run outside a phone.
+- **The live instance now runs this brief's commit**, migrated v7 → v8 on
+  2026-11-05. It had been eight commits behind — code and database agreeing at
+  schema 7, so stale rather than half-migrated, and it refused to start against
+  the old database instead of guessing. It is loopback-only with no provider
+  credential, so the write path below is still unproven, but the recent work
+  has now run somewhere other than a phone.
 - Not load-tested.
 
 ## 8. What would come next, in order
